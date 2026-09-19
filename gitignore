@@ -1,0 +1,18 @@
+# Saídas geradas pelo próprio SCARFACE (não fazem parte do código-fonte)
+dados*.json
+relatorio*.md
+demo_*.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
