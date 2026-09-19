@@ -2,7 +2,7 @@
 
 **S**ystematic **C**yber **A**ttack **R**ecognition and **F**orensic **A**nalysis of **C**ritical **E**vents
 
-Ferramenta de linha de comando em Python para análise forense de logs, feita para identificar rapidamente sinais de ataque em servidores Linux (SSH) e aplicações web (Apache/HTTP).
+Ferramenta de linha de comando em Python para análise forense de logs, feita para identificar rapidamente sinais de ataque em servidores Linux (SSH) e aplicações web (Apache/HTTP). Funciona em Windows, macOS e qualquer distro Linux, sem dependências externas.
 
 ```
   ███████╗ ██████╗ █████╗ ██████╗ ███████╗ █████╗  ██████╗███████╗
@@ -18,7 +18,7 @@ Ferramenta de linha de comando em Python para análise forense de logs, feita pa
 | # | Ameaça | Como é identificada |
 |---|--------|----------------------|
 | 1 | **Brute Force** | Muitas falhas de login vindas do mesmo IP dentro de uma janela de tempo curta (algoritmo de janela deslizante, O(n)) |
-| 2 | **Comprometimento** | Um IP que falhou o login várias vezes seguidas e, logo depois, conseguiu acertar (indício de conta invadida) |
+| 2 | **Comprometimento** | Um IP que falhou o login várias vezes *seguidas* e, logo em seguida (dentro de uma janela configurável), conseguiu acertar (indício de conta invadida) |
 | 3 | **Escaneamento** | Rajada de respostas HTTP 404 do mesmo IP (alguém procurando diretórios, backups, painéis de admin) |
 | 4 | **Ataques em URL** | Assinaturas de SQL Injection, XSS, Path Traversal e Command Injection nos parâmetros das requisições |
 
@@ -31,13 +31,15 @@ Ferramenta de linha de comando em Python para análise forense de logs, feita pa
 
 ## Instalação
 
-Requer apenas **Python 3.8+** — sem dependências externas para rodar a ferramenta.
+Requer apenas **Python 3.8+** — sem dependências externas para rodar a ferramenta. Testado em Windows (PowerShell/cmd), macOS e distros Linux (Ubuntu, Debian, Fedora, Arch).
 
 ```bash
 git clone https://github.com/x64gh0st/scarface.git
 cd scarface
 python scarface.py --demo
 ```
+
+> No Linux/macOS, use `python3` em vez de `python` se o seu sistema não tiver o alias configurado.
 
 Para rodar os testes unitários (opcional):
 ```bash
@@ -57,11 +59,17 @@ python scarface.py access.log --saida relatorio.md --json dados.json
 # Ajustar sensibilidade da detecção de brute force
 python scarface.py auth.log --limite 3 --janela 60
 
+# Ajustar a janela de tempo para considerar comprometimento de conta
+python scarface.py auth.log --janela-comprometimento 300
+
 # Rodar sem cores (útil ao redirecionar a saída para arquivo)
 python scarface.py auth.log --sem-cor
 
-# Testar com dados fictícios, sem precisar de um log real
+# Testar com dados fictícios de SSH, sem precisar de um log real
 python scarface.py --demo
+
+# Testar com dados fictícios de HTTP (mostra escaneamento e ataques em URL)
+python scarface.py --demo --demo-tipo apache
 ```
 
 ### Opções disponíveis
@@ -70,11 +78,12 @@ python scarface.py --demo
 |---|---|---|
 | `arquivo` | Caminho do arquivo de log a analisar | — |
 | `--demo` | Roda com um log fictício de demonstração | — |
+| `--demo-tipo` | Qual log fictício usar com `--demo`: `auth` ou `apache` | `auth` |
 | `--formato` | `auto`, `auth`, `apache` ou `geral` | `auto` |
-| `--limite` | Nº de falhas para alertar brute force | `5` |
-| `--janela` | Janela de tempo (segundos) para o brute force | `300` |
-| `--limite-404` | Nº de 404 para alertar escaneamento | `10` |
-| `--janela-comprometimento` | Segundos entre a última falha e o sucesso para considerar comprometimento | `600` |
+| `--limite` | Nº de falhas para alertar brute force (inteiro > 0) | `5` |
+| `--janela` | Janela de tempo em segundos para o brute force (inteiro ≥ 0; `0` desativa a janela) | `300` |
+| `--limite-404` | Nº de 404 para alertar escaneamento (inteiro > 0) | `10` |
+| `--janela-comprometimento` | Segundos entre a última falha e o sucesso para considerar comprometimento (inteiro > 0) | `600` |
 | `--saida ARQUIVO.md` | Salva relatório em Markdown | — |
 | `--json ARQUIVO.json` | Salva dados estruturados em JSON | — |
 | `--sem-cor` | Desativa cores no terminal | — |
@@ -109,16 +118,34 @@ Intervalo falha->sucesso: 144s
 scarface/
 ├── scarface.py         # ferramenta principal
 ├── test_scarface.py    # testes unitários (pytest)
+├── .gitignore          # ignora relatórios/dados gerados pela própria ferramenta
 └── README.md
 ```
 
 ## Como funciona por dentro
 
-- **Parsing**: cada linha do log é transformada em um registro estruturado (`ip`, `data`, `usuário`, `evento`, `tipo`), com regex específicas por formato.
+- **Parsing**: cada linha do log é transformada em um registro estruturado (`ip`, `data`, `usuário`, `evento`, `tipo`), com regex específicas por formato — inclusive regex separadas para `Failed/Accepted password` e `Invalid user`, já que têm estruturas de frase diferentes.
 - **Brute force**: usa o algoritmo de janela deslizante com dois ponteiros (O(n)) para achar a maior rajada de falhas de um mesmo IP dentro do intervalo de tempo configurado.
 - **Comprometimento**: exige uma sequência mínima de falhas *imediatamente* seguida de um sucesso dentro da janela configurada — evita falsos positivos de logins legítimos sem relação com tentativas antigas.
 - **Escaneamento**: agrupa respostas 404 por IP e caminho acessado.
 - **Ataques em URL**: aplica assinaturas regex conhecidas (SQLi, XSS, Path Traversal, Command Injection) sobre o caminho de cada requisição.
+
+### Robustez
+
+A ferramenta foi endurecida contra os casos mais comuns de falha em uso real:
+
+- Validação de argumentos (ex.: `--limite 0` ou negativo é rejeitado com mensagem clara, em vez de gerar alertas inúteis)
+- Arquivo vazio, inexistente, sem permissão de leitura, ou uma pasta passada por engano — cada caso tem uma mensagem específica
+- Pasta de destino de `--saida`/`--json` é validada *antes* de processar o log inteiro
+- Leitura tolerante a encoding (tenta UTF-8, cai para latin-1) — cobre logs gerados no Windows em `cp1252`
+- `Ctrl+C` e pipes cortados (`scarface.py log | head`) encerram de forma limpa, sem traceback
+- Qualquer erro inesperado é capturado no topo e mostrado de forma legível
+
+### Compatibilidade entre sistemas operacionais
+
+- **Cores no terminal**: no Windows, o script habilita automaticamente o processamento de códigos ANSI no console (necessário no `cmd.exe`/PowerShell legado); no Linux e macOS as cores já funcionam nativamente.
+- **Caminhos de arquivo**: tratados com `pathlib`, então funcionam igual com `\` (Windows) ou `/` (Linux/macOS).
+- Use `--sem-cor` em qualquer sistema se preferir saída sem formatação (por exemplo, ao redirecionar para um arquivo).
 
 ## Roadmap / possíveis melhorias
 
