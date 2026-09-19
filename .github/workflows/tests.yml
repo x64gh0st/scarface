@@ -1,0 +1,41 @@
+name: Testes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  testes:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.8", "3.10", "3.12"]
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Instalar pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Rodar testes unitários
+        run: pytest test_scarface.py -v
+
+      - name: Testar modo demo (SSH)
+        run: python scarface.py --demo --sem-cor
+
+      - name: Testar modo demo (HTTP)
+        run: python scarface.py --demo --demo-tipo apache --sem-cor
+
+      - name: Testar --versao
+        run: python scarface.py --versao

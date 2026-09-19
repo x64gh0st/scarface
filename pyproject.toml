@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scarface-log-analyzer"
+version = "2.1.0a1"
+description = "Analisador de logs que caça brute force, comprometimento de contas, escaneamento e ataques em URL (SQLi, XSS, Path Traversal, Command Injection)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Educational / Portfolio use" }
+authors = [
+    { name = "Pedro Henrique Almeida", email = "" }
+]
+keywords = ["cybersecurity", "log-analysis", "brute-force", "siem", "pentest", "blue-team"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+scarface = "scarface:main"
+
+[project.urls]
+Repository = "https://github.com/x64gh0st/scarface"
+Changelog = "https://github.com/x64gh0st/scarface/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+py-modules = ["scarface"]

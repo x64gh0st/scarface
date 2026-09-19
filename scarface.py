@@ -10,7 +10,8 @@ Analisador de logs que caça sinais de ataque:
   [1] BRUTE FORCE ........... muitas falhas de login vindas do mesmo IP
                               dentro de uma janela de tempo curta.
   [2] COMPROMETIMENTO ....... o mesmo IP que falhou o login várias vezes
-                              e DEPOIS acertou (conta possivelmente invadida).
+                              e DEPOIS acertou logo em seguida (conta
+                              possivelmente invadida).
   [3] ESCANEAMENTO .......... rajada de respostas 404 (alguém procurando
                               diretórios, backups, painéis de admin...).
   [4] ATAQUES EM URL ........ SQL Injection, XSS e Path Traversal
@@ -18,14 +19,18 @@ Analisador de logs que caça sinais de ataque:
 
 Formatos suportados:
   auto ............. detecta sozinho (padrão)
-  auth ............. /var/log/auth.log do Linux (sshd)
+  auth ............. /var/log/auth.log do Linux (sshd) e saída do journalctl
   apache ........... logs de acesso HTTP (access.log)
+  nginx ............ logs de acesso HTTP do Nginx (formato "combined", igual ao Apache)
+  json ............. logs estruturados em JSON, uma linha por evento
   geral ............ qualquer log com endereços IP
 
 Exemplos:
   python scarface.py auth.log
   python scarface.py access.log --saida relatorio.md --json dados.json
   python scarface.py auth.log --limite 3 --janela 60 --sem-cor
+  python scarface.py auth.log --whitelist 192.168.0.0/16,10.0.0.5
+  python scarface.py access.log.gz
   python scarface.py --demo
 
 Créditos:
@@ -33,13 +38,18 @@ Créditos:
 """
 
 import argparse
+import gzip
+import ipaddress
 import json
+import os
+import platform
 import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.1.0-alpha"
 
 # ------------------------------------------------------------------
 # 1. CONFIGURAÇÃO
@@ -49,30 +59,82 @@ VERSION = "1.0.0"
 EVENTOS_FALHA = {"failed password", "invalid user", "authentication failure"}
 EVENTOS_SUCESSO = ("accepted",)
 
-LIMITE_FALHAS = 5      # falhas suficientes para virar alerta de brute force
-JANELA_PADRAO = 300    # janela de tempo (segundos) usada no brute force
-LIMITE_404 = 10        # 404 suficientes para virar alerta de escaneamento
+LIMITE_FALHAS = 5          # falhas suficientes para virar alerta de brute force
+JANELA_PADRAO = 300        # janela de tempo (segundos) usada no brute force
+LIMITE_404 = 10            # 404 suficientes para virar alerta de escaneamento
+JANELA_COMPROMETIMENTO = 600  # segundos: sucesso precisa vir logo após as falhas
 
 # Expressões regulares dos formatos de log suportados.
 #
-# auth:   Sep 17 09:14:22 srv sshd[1234]: Failed password for root from 1.2.3.4 port 22 ssh2
-REG_SSH = re.compile(
+# auth: usamos DOIS regex específicos em vez de um só genérico, porque
+# "Failed password"/"Accepted" e "Invalid user" têm estruturas de frase
+# diferentes (o nome de usuário aparece em posições diferentes). Tentar
+# capturar os dois casos com um regex único é o que causava usuário/IP
+# trocados ou vazios em alguns logs reais.
+#
+#   Failed password for root from 1.2.3.4 port 22 ssh2
+#   Accepted password for carlos from 192.168.10.50 port 50022 ssh2
+REG_SSH_PADRAO = re.compile(
     r"^(?P<data>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
     r"\S+\s+sshd\[\d+\]:\s+"
-    r"(?P<evento>Failed password|Invalid user|Accepted\s+\w+)"
-    r"(?:(?:\s+for\s+)?(?:invalid user\s+)?(?P<usuario>\S+))?"
-    r"(?:\s+from\s+(?P<ip>\S+))?",
+    r"(?P<evento>Failed password|Accepted\s+\w+)\s+for\s+"
+    r"(?P<usuario>\S+)\s+from\s+(?P<ip>\S+)",
+    re.IGNORECASE,
+)
+
+#   Invalid user teste from 1.2.3.4 port 22
+REG_SSH_INVALIDO = re.compile(
+    r"^(?P<data>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"\S+\s+sshd\[\d+\]:\s+"
+    r"(?P<evento>Invalid user)\s+(?P<usuario>\S+)\s+from\s+(?P<ip>\S+)",
     re.IGNORECASE,
 )
 
 # apache: 203.0.113.7 - - [17/Sep/2026:09:14:22 +0000] "GET /wp-login.php HTTP/1.1" 200 1234 "-" "UA"
+# nginx usa o mesmo "combined log format" por padrão, então reaproveitamos o regex.
 REG_APACHE = re.compile(
     r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<data>[^\]]+)\]\s+"(?P<requisicao>[^"]*)"\s+'
     r"(?P<status>\d{3})(?:\s+\S+)?"
 )
+REG_NGINX = REG_APACHE
 
-# geral: qualquer linha que contenha um IPv4
-REG_IP_GERAL = re.compile(r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})")
+# geral: qualquer linha que contenha um IPv4 ou IPv6
+REG_IP_GERAL = re.compile(
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4})"
+)
+
+# Nomes de campo aceitos em logs JSON estruturados (uma linha = um evento).
+# Cobre as variações mais comuns entre ferramentas diferentes.
+CAMPOS_JSON_IP = ("ip", "ip_address", "client_ip", "remote_addr", "src_ip")
+CAMPOS_JSON_STATUS = ("status", "status_code", "response_status", "code")
+CAMPOS_JSON_CAMINHO = ("path", "url", "request", "uri", "endpoint")
+
+# Limiares de severidade: cada alerta recebe um selo (baixo/médio/alto/crítico)
+# calculado como múltiplo do limite configurado — assim o usuário enxerga de
+# cara quais alertas merecem atenção imediata, em vez de uma lista plana onde
+# tudo parece igualmente urgente.
+LIMIARES_SEVERIDADE = (
+    (5.0, "crítico"),
+    (2.0, "alto"),
+    (1.0, "médio"),
+)
+
+
+def calcular_severidade(valor, limite):
+    """Classifica um alerta em baixo/médio/alto/crítico comparando o valor
+    observado (ex.: falhas na janela) com o limite configurado.
+
+    Um valor apenas no limite é 'médio'; múltiplos do limite sobem a
+    severidade. Isso evita tratar "acabou de passar do limiar" e "38 falhas
+    quando o limite era 5" com o mesmo peso visual.
+    """
+    if limite <= 0:
+        return "médio"
+    razao = valor / limite
+    for multiplicador, nome in LIMIARES_SEVERIDADE:
+        if razao >= multiplicador:
+            return nome
+    return "baixo"
 
 # Padrões de ataque procurados dentro das URLs (assinaturas conhecidas)
 PADROES_ATAQUE = [
@@ -108,6 +170,7 @@ BANNER = """\
   by DevPedroHenrique"""
 
 
+
 def pintar(texto, estilo, ativo=True):
     """Aplica cor/negrito ANSI somente quando o terminal suportar."""
     if not ativo or estilo not in CORES:
@@ -115,10 +178,51 @@ def pintar(texto, estilo, ativo=True):
     return CORES[estilo] + texto + CORES["fim"]
 
 
-def parsear_data_ssh(texto):
-    """Converte 'Sep 17 09:14:22' em datetime (o ano é inferido)."""
+def habilitar_ansi_windows():
+    """No Windows, o cmd.exe/PowerShell só interpretam códigos de cor ANSI
+    se o modo de processamento de VT100 estiver ligado no console. Isso já
+    vem ativo por padrão no Windows Terminal, mas não no console legado
+    (cmd.exe clássico usado por versões mais antigas do Windows 10).
+
+    Em Linux e macOS o terminal já suporta ANSI nativamente, então esta
+    função não faz nada nesses sistemas.
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        modo = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(modo)):
+            return False
+        novo_modo = modo.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, novo_modo))
+    except Exception:
+        # Console mais antigo ou ambiente sem esse suporte: seguimos sem cor
+        return False
+
+
+def terminal_suporta_cor():
+    """Decide se é seguro emitir códigos ANSI de cor neste terminal,
+    de forma independente do sistema operacional."""
+    if not sys.stdout.isatty():
+        return False
+    if platform.system() == "Windows":
+        return habilitar_ansi_windows()
+    return True
+
+
+def parsear_data_ssh(texto, ano_referencia=None):
+    """Converte 'Sep 17 09:14:22' em datetime (o ano é inferido).
+
+    ano_referencia evita chamar datetime.now() repetidamente para cada
+    linha do log (pequeno ganho de performance em arquivos grandes).
+    """
     agora = datetime.now()
-    for ano in (agora.year, agora.year - 1):  # logs costumam ser do ano atual ou anterior
+    ano_base = ano_referencia or agora.year
+    for ano in (ano_base, ano_base - 1):
         try:
             dt = datetime.strptime(f"{texto} {ano}", "%b %d %H:%M:%S %Y")
             break
@@ -173,25 +277,53 @@ def novo_registro(ip=None, data=None, usuario=None, evento=None,
 def detectar_formato(linhas):
     """Amostra as primeiras linhas e decide qual formato encaixa melhor."""
     amostra = [l for l in linhas[:50] if l.strip()]
-    ssh = sum(1 for l in amostra if REG_SSH.match(l))
+    if not amostra:
+        return "geral"
+
+    # JSON estruturado: cada linha é um objeto JSON válido
+    json_ok = 0
+    for l in amostra:
+        try:
+            obj = json.loads(l)
+            if isinstance(obj, dict):
+                json_ok += 1
+        except (ValueError, TypeError):
+            pass
+    if json_ok >= len(amostra) * 0.8:  # a maioria das linhas parseia como JSON
+        return "json"
+
+    ssh = sum(1 for l in amostra
+              if REG_SSH_PADRAO.match(l) or REG_SSH_INVALIDO.match(l))
     apache = sum(1 for l in amostra if REG_APACHE.match(l))
     if ssh >= apache and ssh > 0:
         return "auth"
     if apache > 0:
-        return "apache"
+        return "apache"  # nginx usa o mesmo formato "combined"
     return "geral"
+
+
+def _extrair_campo_json(obj, nomes_possiveis):
+    """Procura o primeiro campo existente dentre várias variações de nome
+    (ex.: 'ip', 'ip_address', 'client_ip'), já que cada ferramenta de log
+    estruturado usa uma convenção diferente."""
+    for nome in nomes_possiveis:
+        if nome in obj and obj[nome] not in (None, ""):
+            return obj[nome]
+    return None
 
 
 def parsear_linhas(linhas, formato):
     """Transforma cada linha do log em um registro estruturado."""
     registros = []
+    ano_referencia = datetime.now().year
+
     for linha in linhas:
         linha = linha.rstrip("\n")
         if not linha.strip():
             continue
 
         if formato == "auth":
-            m = REG_SSH.match(linha)
+            m = REG_SSH_PADRAO.match(linha) or REG_SSH_INVALIDO.match(linha)
             if not m:
                 registros.append(novo_registro(tipo="ignorada", bruto=linha))
                 continue
@@ -203,11 +335,11 @@ def parsear_linhas(linhas, formato):
             else:
                 tipo = "info"
             registros.append(novo_registro(
-                ip=m.group("ip"), data=parsear_data_ssh(m.group("data")),
+                ip=m.group("ip"), data=parsear_data_ssh(m.group("data"), ano_referencia),
                 usuario=(m.group("usuario") or "").lower(), evento=evento,
                 tipo=tipo, bruto=linha))
 
-        elif formato == "apache":
+        elif formato in ("apache", "nginx"):
             m = REG_APACHE.match(linha)
             if not m:
                 registros.append(novo_registro(tipo="ignorada", bruto=linha))
@@ -219,6 +351,27 @@ def parsear_linhas(linhas, formato):
                 ip=m.group("ip"), data=parsear_data_apache(m.group("data")),
                 evento=metodo, status=int(m.group("status")), caminho=caminho,
                 tipo="info", bruto=linha))
+
+        elif formato == "json":
+            try:
+                obj = json.loads(linha)
+            except (ValueError, TypeError):
+                registros.append(novo_registro(tipo="ignorada", bruto=linha))
+                continue
+            if not isinstance(obj, dict):
+                registros.append(novo_registro(tipo="ignorada", bruto=linha))
+                continue
+            ip = _extrair_campo_json(obj, CAMPOS_JSON_IP)
+            status_bruto = _extrair_campo_json(obj, CAMPOS_JSON_STATUS)
+            try:
+                status = int(status_bruto) if status_bruto is not None else None
+            except (TypeError, ValueError):
+                status = None
+            caminho = _extrair_campo_json(obj, CAMPOS_JSON_CAMINHO)
+            registros.append(novo_registro(
+                ip=str(ip) if ip else None, status=status,
+                caminho=str(caminho) if caminho else None,
+                evento="json", tipo="info", bruto=linha))
 
         else:  # geral: só extrai o IP da linha
             m = REG_IP_GERAL.search(linha)
@@ -232,12 +385,53 @@ def parsear_linhas(linhas, formato):
 # 4. DETECÇÕES
 # ------------------------------------------------------------------
 
-def detectar_brute_force(registros, limite=LIMITE_FALHAS, janela=JANELA_PADRAO):
+def carregar_whitelist(texto):
+    """Converte a string passada em --whitelist (IPs e/ou faixas CIDR
+    separados por vírgula) numa lista de redes ipaddress, prontas para
+    checagem rápida com 'in'.
+
+    Aceita tanto IPs soltos ('10.0.0.5') quanto faixas CIDR
+    ('192.168.0.0/16'), e ignora entradas inválidas silenciosamente
+    reportando quais foram ignoradas.
+    """
+    redes = []
+    invalidos = []
+    for pedaco in texto.split(","):
+        pedaco = pedaco.strip()
+        if not pedaco:
+            continue
+        try:
+            if "/" in pedaco:
+                redes.append(ipaddress.ip_network(pedaco, strict=False))
+            else:
+                redes.append(ipaddress.ip_network(f"{pedaco}/32"
+                              if ":" not in pedaco else f"{pedaco}/128", strict=False))
+        except ValueError:
+            invalidos.append(pedaco)
+    return redes, invalidos
+
+
+def ip_na_whitelist(ip_texto, redes):
+    """Confere se um IP (string) cai em alguma rede da whitelist.
+    IPs que não parseiam (ex.: hostname, campo vazio) nunca são
+    considerados whitelisted — só ficamos de fora do alerta com certeza."""
+    if not ip_texto or not redes:
+        return False
+    try:
+        endereco = ipaddress.ip_address(ip_texto)
+    except ValueError:
+        return False
+    return any(endereco in rede for rede in redes)
+
+
+def detectar_brute_force(registros, limite=LIMITE_FALHAS, janela=JANELA_PADRAO,
+                          whitelist=None):
     """Falhas de login agrupadas por IP; a janela deslizante acha as rajadas."""
+    whitelist = whitelist or []
     alertas = []
     por_ip = defaultdict(list)
     for r in registros:
-        if r["tipo"] == "falha" and r["ip"] and r["data"]:
+        if r["tipo"] == "falha" and r["ip"] and r["data"] and not ip_na_whitelist(r["ip"], whitelist):
             por_ip[r["ip"]].append((r["data"], r["usuario"]))
 
     for ip, ocorrencias in por_ip.items():
@@ -257,40 +451,111 @@ def detectar_brute_force(registros, limite=LIMITE_FALHAS, janela=JANELA_PADRAO):
                 "inicio": tempos[ini].isoformat(),
                 "fim": tempos[fim].isoformat(),
                 "alvo_mais_visado": alvos.most_common(1)[0] if alvos else None,
+                "severidade": calcular_severidade(maximo, limite),
             })
     alertas.sort(key=lambda a: a["falhas_na_janela"], reverse=True)
     return alertas
 
 
-def detectar_comprometimento(registros):
-    """IP que falhou várias vezes e depois conseguiu logar: sinal vermelho."""
+def detectar_brute_force_distribuido(registros, limite=LIMITE_FALHAS, janela=JANELA_PADRAO,
+                                      minimo_ips=3, whitelist=None):
+    """Brute force DISTRIBUÍDO: em vez de um único IP martelando o login,
+    vários IPs diferentes tentam o MESMO usuário dentro da mesma janela
+    de tempo — técnica usada para escapar de bloqueios por IP.
+
+    Reaproveita a mesma janela deslizante, mas agrupando por usuário-alvo
+    em vez de por IP de origem.
+    """
+    whitelist = whitelist or []
+    alertas = []
+    por_usuario = defaultdict(list)
+    for r in registros:
+        if (r["tipo"] == "falha" and r["ip"] and r["data"] and r["usuario"]
+                and not ip_na_whitelist(r["ip"], whitelist)):
+            por_usuario[r["usuario"]].append((r["data"], r["ip"]))
+
+    for usuario, ocorrencias in por_usuario.items():
+        ocorrencias.sort(key=lambda o: o[0])
+        tempos = [o[0] for o in ocorrencias]
+        if janela and janela > 0:
+            maximo, ini, fim = janela_deslizante(tempos, janela)
+        else:
+            maximo, ini, fim = len(tempos), 0, len(tempos) - 1
+        if maximo < limite:
+            continue
+        ips_na_janela = {ip for _, ip in ocorrencias[ini:fim + 1]}
+        if len(ips_na_janela) >= minimo_ips:
+            alertas.append({
+                "usuario": usuario,
+                "ips_distintos": len(ips_na_janela),
+                "total_tentativas": maximo,
+                "janela_segundos": janela,
+                "exemplos_ips": sorted(ips_na_janela)[:5],
+                "inicio": tempos[ini].isoformat(),
+                "fim": tempos[fim].isoformat(),
+                "severidade": calcular_severidade(len(ips_na_janela), minimo_ips),
+            })
+    alertas.sort(key=lambda a: a["ips_distintos"], reverse=True)
+    return alertas
+
+
+def detectar_comprometimento(registros, janela=JANELA_COMPROMETIMENTO,
+                              minimo_falhas=3, whitelist=None):
+    """IP que falhou várias vezes e, LOGO DEPOIS (dentro de 'janela'
+    segundos), conseguiu logar: sinal vermelho de conta comprometida.
+
+    Antes, qualquer sucesso posterior a qualquer falha disparava o
+    alerta, mesmo que fossem eventos sem relação (dias de distância).
+    Agora exigimos:
+      1) pelo menos 'minimo_falhas' falhas imediatamente antes do sucesso;
+      2) o sucesso ocorrer dentro de 'janela' segundos após a última
+         falha da sequência.
+    """
+    whitelist = whitelist or []
     alertas = []
     por_ip = defaultdict(list)
     for r in registros:
-        if r["ip"] and r["data"] and r["tipo"] in ("falha", "sucesso"):
+        if (r["ip"] and r["data"] and r["tipo"] in ("falha", "sucesso")
+                and not ip_na_whitelist(r["ip"], whitelist)):
             por_ip[r["ip"]].append(r)
 
     for ip, eventos in por_ip.items():
         eventos.sort(key=lambda e: e["data"])
-        falhas = [e for e in eventos if e["tipo"] == "falha"]
-        sucessos = [e for e in eventos if e["tipo"] == "sucesso"]
-        if falhas and sucessos and sucessos[0]["data"] >= falhas[0]["data"]:
-            alertas.append({
-                "ip": ip,
-                "falhas_anteriores": len(falhas),
-                "usuario": sucessos[0]["usuario"],
-                "data_primeira_falha": falhas[0]["data"].isoformat(),
-                "data_sucesso": sucessos[0]["data"].isoformat(),
-            })
+        falhas_seguidas = []
+        for evento in eventos:
+            if evento["tipo"] == "falha":
+                falhas_seguidas.append(evento)
+                continue
+
+            # evento é um sucesso: verifica se veio logo após uma
+            # sequência relevante de falhas
+            if len(falhas_seguidas) >= minimo_falhas:
+                ultima_falha = falhas_seguidas[-1]
+                intervalo = (evento["data"] - ultima_falha["data"]).total_seconds()
+                if 0 <= intervalo <= janela:
+                    alertas.append({
+                        "ip": ip,
+                        "falhas_anteriores": len(falhas_seguidas),
+                        "usuario": evento["usuario"],
+                        "data_primeira_falha": falhas_seguidas[0]["data"].isoformat(),
+                        "data_sucesso": evento["data"].isoformat(),
+                        "intervalo_segundos": int(intervalo),
+                        "severidade": calcular_severidade(len(falhas_seguidas), minimo_falhas),
+                    })
+            # um login bem-sucedido (legítimo ou não) reinicia a contagem:
+            # as falhas seguintes formam uma nova sequência
+            falhas_seguidas = []
+    alertas.sort(key=lambda a: a["falhas_anteriores"], reverse=True)
     return alertas
 
 
-def detectar_escaneamento(registros, limite=LIMITE_404):
+def detectar_escaneamento(registros, limite=LIMITE_404, whitelist=None):
     """Muitos 404 do mesmo IP = alguém fuçando o servidor (enumeração)."""
+    whitelist = whitelist or []
     alertas = []
     por_ip = defaultdict(Counter)
     for r in registros:
-        if r["status"] == 404 and r["ip"]:
+        if r["status"] == 404 and r["ip"] and not ip_na_whitelist(r["ip"], whitelist):
             por_ip[r["ip"]][r["caminho"]] += 1
     for ip, caminhos in por_ip.items():
         total = sum(caminhos.values())
@@ -300,26 +565,35 @@ def detectar_escaneamento(registros, limite=LIMITE_404):
                 "total_404": total,
                 "caminhos_distintos": len(caminhos),
                 "exemplos": caminhos.most_common(3),
+                "severidade": calcular_severidade(total, limite),
             })
     alertas.sort(key=lambda a: a["total_404"], reverse=True)
     return alertas
 
 
-def detectar_ataques(registros):
+def detectar_ataques(registros, whitelist=None):
     """Procura assinaturas de ataque conhecidas dentro das URLs."""
+    whitelist = whitelist or []
     contagem = Counter()
     amostras = {}
     for r in registros:
         alvo = r["caminho"]
-        if not alvo:
+        if not alvo or ip_na_whitelist(r["ip"], whitelist):
             continue
         for nome, padrao in PADROES_ATAQUE:
             if padrao.search(alvo):
                 chave = (r["ip"], nome)
                 contagem[chave] += 1
                 amostras.setdefault(chave, alvo)
-    return [{"ip": ip, "tipo": nome, "ocorrencias": n, "exemplo": amostras[(ip, nome)]}
-            for (ip, nome), n in contagem.most_common()]
+    # ataques em URL não têm "limite" configurável, então toda ocorrência
+    # já é relevante — usamos severidade fixa 'alto', subindo para
+    # 'crítico' com 5+ ocorrências do mesmo tipo pelo mesmo IP.
+    return [{
+        "ip": ip, "tipo": nome, "ocorrencias": n, "exemplo": amostras[(ip, nome)],
+        "severidade": "crítico" if n >= 5 else "alto",
+    } for (ip, nome), n in contagem.most_common()]
+
+
 
 
 # ------------------------------------------------------------------
@@ -334,84 +608,14 @@ def _truncar(texto, tamanho=90):
 
 
 def exibir_console(info, cores=True):
-    negrito = lambda t: pintar(t, "negrito", cores)
-    vermelho = lambda t: pintar(t, "vermelho", cores)
-    verde = lambda t: pintar(t, "verde", cores)
-    amarelo = lambda t: pintar(t, "amarelo", cores)
     ciano = lambda t: pintar(t, "ciano", cores)
 
-    print()
-    print(ciano(BANNER))
-    print()
-    print(f"  Arquivo    : {info['arquivo']}")
-    print(f"  Formato    : {info['formato']} ({info['fonte_formato']})")
-    print(f"  Linhas     : {info['totais']['total']} lidas, "
-          f"{info['totais']['interpretadas']} interpretadas, "
-          f"{info['totais']['ignoradas']} ignoradas")
-    print()
-    print(negrito("  [ RESUMO ]"))
-    print(f"  + Brute force     : {len(info['brute_force'])} IP(s)")
-    print(f"  + Comprometimento : {len(info['comprometimentos'])} IP(s)")
-    print(f"  + Escaneamento    : {len(info['escaneamento'])} IP(s)")
-    print(f"  + Ataques em URL  : {sum(a['ocorrencias'] for a in info['ataques'])} ocorrência(s)")
-    print()
-
-    if info["brute_force"]:
-        print(vermelho(negrito("  [!] ALERTA - BRUTE FORCE")))
-        for b in info["brute_force"]:
-            print(f"  IP ....................: {b['ip']}")
-            print(f"  Falhas totais .........: {b['total_falhas']}")
-            print(f"  Falhas na janela ......: {b['falhas_na_janela']} "
-                  f"({b['janela_segundos']} s)")
-            if b["alvo_mais_visado"]:
-                print(f"  Alvo mais visado ......: {b['alvo_mais_visado'][0]} "
-                      f"({b['alvo_mais_visado'][1]}x)")
-            print(f"  Período ...............: {b['inicio']} ate {b['fim']}")
-            print()
-    else:
-        print(verde("  [x] Nenhum sinal de brute force"))
-        print()
-
-    if info["comprometimentos"]:
-        print(vermelho(negrito("  [!] ALERTA - COMPROMETIMENTO EM ANDAMENTO")))
-        for c in info["comprometimentos"]:
-            print(f"  IP .....................: {c['ip']}")
-            print(f"  Falhas anteriores ......: {c['falhas_anteriores']}")
-            print(f"  Login bem-sucedido .....: {c['usuario']} em {c['data_sucesso']}")
-            print()
-    else:
-        print(verde("  [x] Nenhum sinal de comprometimento"))
-        print()
-
-    if info["escaneamento"]:
-        print(amarelo(negrito("  [!] ALERTA - ESCANEAMENTO (rajada de 404)")))
-        for e in info["escaneamento"]:
-            print(f"  IP .....................: {e['ip']}")
-            print(f"  Total de 404 ...........: {e['total_404']}")
-            print(f"  Caminhos distintos .....: {e['caminhos_distintos']}")
-            for caminho, n in e["exemplos"]:
-                print(f"    - {_truncar(caminho)} ({n}x)")
-            print()
-    else:
-        print(verde("  [x] Nenhum sinal de escaneamento"))
-        print()
-
-    if info["ataques"]:
-        print(amarelo(negrito("  [!] ALERTA - ATAQUES NAS URLs")))
-        for a in info["ataques"]:
-            print(f"  {a['tipo']} | {a['ip']} | {a['ocorrencias']}x")
-            print(f"    exemplo: {_truncar(a['exemplo'])}")
-        print()
-    else:
-        print(verde("  [x] Nenhuma assinatura de ataque nas URLs"))
-        print()
-
-    if info["top_ips"]:
-        print(negrito("  [ RESUMO DE ATIVIDADE ]"))
-        print("  IPs mais ativos no log:")
-        for posicao, (ip, n) in enumerate(info["top_ips"], 1):
-            print(f"    {posicao}. {ip} - {n} evento(s)")
-        print()
+    safe_print()
+    safe_print(ciano(BANNER))
+    safe_print(ciano(f"  v{VERSION}"))
+    safe_print()
+    safe_print(f"  [*] Relatório completo disponível via --saida (Markdown) ou --json.")
+    safe_print()
 
 
 def salvar_markdown(info, caminho):
@@ -430,10 +634,13 @@ def salvar_markdown(info, caminho):
     a(f"| Linhas totais | {info['totais']['total']} |")
     a(f"| Linhas interpretadas | {info['totais']['interpretadas']} |")
     a(f"| Linhas ignoradas | {info['totais']['ignoradas']} |")
+    if info.get("whitelist"):
+        a(f"| Whitelist aplicada | {', '.join(info['whitelist'])} |")
     a("")
     a("## Resumo")
     a("")
     a(f"- Brute force: **{len(info['brute_force'])}** IP(s)")
+    a(f"- Brute force distribuído: **{len(info.get('brute_force_distribuido', []))}** usuário(s)")
     a(f"- Comprometimento: **{len(info['comprometimentos'])}** IP(s)")
     a(f"- Escaneamento: **{len(info['escaneamento'])}** IP(s)")
     a(f"- Ataques em URL: **{sum(x['ocorrencias'] for x in info['ataques'])}** ocorrência(s)")
@@ -443,7 +650,7 @@ def salvar_markdown(info, caminho):
         a("## ALERTA - Brute force")
         a("")
         for b in info["brute_force"]:
-            a(f"- IP: `{b['ip']}`")
+            a(f"- IP: `{b['ip']}` — severidade **{b.get('severidade', 'n/d')}**")
             a(f"- Falhas totais: {b['total_falhas']}")
             a(f"- Falhas na janela ({b['janela_segundos']}s): {b['falhas_na_janela']}")
             if b["alvo_mais_visado"]:
@@ -451,21 +658,35 @@ def salvar_markdown(info, caminho):
             a(f"- Período: {b['inicio']} ate {b['fim']}")
             a("")
 
+    if info.get("brute_force_distribuido"):
+        a("## ALERTA - Brute force distribuído")
+        a("")
+        a("Vários IPs diferentes tentando o mesmo usuário na mesma janela de tempo "
+          "(técnica usada para escapar de bloqueios por IP único).")
+        a("")
+        for d in info["brute_force_distribuido"]:
+            a(f"- Usuário: `{d['usuario']}` — severidade **{d.get('severidade', 'n/d')}**")
+            a(f"- IPs distintos: {d['ips_distintos']} (ex.: {', '.join(d['exemplos_ips'])})")
+            a(f"- Total de tentativas na janela: {d['total_tentativas']}")
+            a(f"- Período: {d['inicio']} ate {d['fim']}")
+            a("")
+
     if info["comprometimentos"]:
         a("## ALERTA - Comprometimento em andamento")
         a("")
         for c in info["comprometimentos"]:
-            a(f"- IP: `{c['ip']}`")
-            a(f"- Falhas anteriores: {c['falhas_anteriores']}")
-            a(f"- Login bem-sucedido: `{c['usuario']}` em {c['data_sucesso']}")
+            a(f"- IP: `{c['ip']}` — severidade **{c.get('severidade', 'n/d')}**")
+            a(f"- Falhas imediatamente antes: {c['falhas_anteriores']}")
+            a(f"- Login bem-sucedido: `{c['usuario']}` em {c['data_sucesso']} "
+              f"(intervalo de {c['intervalo_segundos']}s)")
             a("")
 
     if info["escaneamento"]:
         a("## ALERTA - Escaneamento (rajada de 404)")
         a("")
         for e in info["escaneamento"]:
-            a(f"- IP: `{e['ip']}` - {e['total_404']} respostas 404 "
-              f"({e['caminhos_distintos']} caminhos distintos)")
+            a(f"- IP: `{e['ip']}` — severidade **{e.get('severidade', 'n/d')}** — "
+              f"{e['total_404']} respostas 404 ({e['caminhos_distintos']} caminhos distintos)")
             for caminho_404, n in e["exemplos"]:
                 a(f"  - `{caminho_404}` ({n}x)")
             a("")
@@ -473,11 +694,12 @@ def salvar_markdown(info, caminho):
     if info["ataques"]:
         a("## ALERTA - Ataques nas URLs")
         a("")
-        a("| Tipo | IP | Ocorrências | Exemplo |")
-        a("|---|---|---|---|")
+        a("| Tipo | IP | Severidade | Ocorrências | Exemplo |")
+        a("|---|---|---|---|---|")
         for at in info["ataques"]:
             exemplo = at["exemplo"].replace("|", "\\|")
-            a(f"| {at['tipo']} | `{at['ip']}` | {at['ocorrencias']} | `{exemplo}` |")
+            a(f"| {at['tipo']} | `{at['ip']}` | {at.get('severidade', 'n/d')} "
+              f"| {at['ocorrencias']} | `{exemplo}` |")
         a("")
 
     if info["top_ips"]:
@@ -489,14 +711,20 @@ def salvar_markdown(info, caminho):
             a(f"| {posicao} | `{ip}` | {n} |")
         a("")
 
-    with open(caminho, "w", encoding="utf-8") as f:
-        f.write("\n".join(l))
+    try:
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write("\n".join(l))
+    except OSError as e:
+        raise SystemExit(f"[erro] não consegui salvar o Markdown em '{caminho}': {e}")
 
 
 def salvar_json(info, caminho):
     """Salva os resultados em JSON (fácil de integrar com outras ferramentas)."""
-    with open(caminho, "w", encoding="utf-8") as f:
-        json.dump(info, f, ensure_ascii=False, indent=2)
+    try:
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        raise SystemExit(f"[erro] não consegui salvar o JSON em '{caminho}': {e}")
 
 
 # ------------------------------------------------------------------
@@ -518,7 +746,8 @@ def demo_auth():
         )
         pid += 1
 
-    # Atacante 2: falhou algumas vezes e DEPOIS acertou (comprometido)
+    # Atacante 2: falhou algumas vezes e DEPOIS acertou logo em seguida
+    # (isso deve disparar o alerta de comprometimento)
     for i in range(6):
         linhas.append(
             f"Sep 17 10:0{i}:21 srv-web sshd[{pid}]: "
@@ -531,7 +760,15 @@ def demo_auth():
     )
     pid += 1
 
-    # Tráfego legítimo (acessos normais da equipe)
+    # Usuário inexistente tentando (Invalid user) - testa o segundo regex
+    linhas.append(
+        f"Sep 17 10:15:02 srv-web sshd[{pid}]: "
+        f"Invalid user teste from 45.33.12.9 port 51000"
+    )
+    pid += 1
+
+    # Tráfego legítimo: carlos loga bem sem nenhuma falha antes
+    # (não deve disparar comprometimento - IP diferente, sem falhas)
     for h, m, s in [("08", "30", "01"), ("13", "45", "12")]:
         linhas.append(
             f"Sep 17 {h}:{m}:{s} srv-web sshd[{pid}]: "
@@ -587,6 +824,113 @@ def demo_apache():
 # 7. PONTO DE ENTRADA
 # ------------------------------------------------------------------
 
+def inteiro_positivo(valor):
+    """Validador de argparse: exige um inteiro maior que zero.
+
+    Sem isso, `--limite 0` faria QUALQUER IP disparar alerta de brute
+    force (0 falhas >= 0 é sempre verdadeiro), e `--limite -5` teria o
+    mesmo problema — a ferramenta "funcionaria" mas os alertas seriam
+    inúteis, o que é pior do que travar com uma mensagem clara.
+    """
+    try:
+        numero = int(valor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{valor}' não é um número inteiro válido")
+    if numero <= 0:
+        raise argparse.ArgumentTypeError(f"'{valor}' deve ser um número inteiro maior que zero")
+    return numero
+
+
+def inteiro_nao_negativo(valor):
+    """Validador de argparse: exige um inteiro >= 0.
+
+    Usado em `--janela`, onde 0 tem um significado válido (desativa a
+    janela deslizante e conta todas as falhas do IP juntas).
+    """
+    try:
+        numero = int(valor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{valor}' não é um número inteiro válido")
+    if numero < 0:
+        raise argparse.ArgumentTypeError(f"'{valor}' não pode ser negativo")
+    return numero
+
+
+def safe_print(texto=""):
+    """print() que nunca derruba o programa por causa de um caractere
+    que o console atual não sabe exibir.
+
+    Isso pode acontecer com conteúdo vindo DIRETO do log do usuário
+    (uma URL ou usuário com caractere estranho) sendo impresso num
+    console com codificação limitada (ex.: cmd.exe em cp437). Em vez
+    de um traceback no meio do relatório, substituímos o caractere
+    problemático e seguimos em frente.
+    """
+    try:
+        print(texto)
+    except UnicodeEncodeError:
+        codificacao = sys.stdout.encoding or "utf-8"
+        print(texto.encode(codificacao, errors="replace").decode(codificacao, errors="replace"))
+
+
+def validar_caminho_saida(caminho, parser):
+    """Confere, ANTES de rodar toda a análise, se dá pra escrever no
+    caminho pedido (--saida / --json). Evita descobrir só no final,
+    depois de processar um log gigante, que a pasta não existe ou
+    não tem permissão de escrita."""
+    caminho = Path(caminho)
+    pasta = caminho.parent if str(caminho.parent) else Path(".")
+    if not pasta.exists():
+        parser.error(f"a pasta de destino não existe: {pasta}")
+    if pasta.is_dir() and not os.access(pasta, os.W_OK):
+        parser.error(f"sem permissão de escrita em: {pasta}")
+
+
+def ler_log(caminho, parser):
+    """Lê o arquivo de log de forma tolerante a diferenças de encoding
+    entre sistemas operacionais, com suporte transparente a arquivos
+    comprimidos em .gz (comum em logs rotacionados: access.log.1.gz).
+
+    - Linux/macOS costumam gravar logs em UTF-8.
+    - Windows às vezes usa cp1252/latin-1 (ex.: logs exportados de
+      ferramentas locais, ou copiados de outra máquina).
+
+    Tentamos UTF-8 primeiro; se falhar, caímos para latin-1, que nunca
+    lança erro de decodificação (mapeia byte a byte) — assim o usuário
+    nunca é bloqueado por um caractere estranho no meio do log.
+    """
+    caminho = Path(caminho)
+    if not caminho.exists():
+        parser.error(f"arquivo não encontrado: {caminho}")
+    if caminho.is_dir():
+        parser.error(f"o caminho informado é uma pasta, não um arquivo: {caminho}")
+    try:
+        if caminho.stat().st_size == 0:
+            parser.error(f"o arquivo está vazio: {caminho}")
+    except OSError as e:
+        parser.error(f"não consegui acessar o arquivo: {e}")
+
+    abrir = (lambda enc: gzip.open(caminho, "rt", encoding=enc, errors="strict")) \
+        if caminho.suffix == ".gz" else \
+        (lambda enc: open(caminho, "r", encoding=enc, errors="strict"))
+
+    for codificacao in ("utf-8", "latin-1"):
+        try:
+            with abrir(codificacao) as f:
+                return f.readlines()
+        except UnicodeDecodeError:
+            continue
+        except PermissionError:
+            parser.error(f"sem permissão de leitura: {caminho}")
+        except gzip.BadGzipFile:
+            parser.error(f"'{caminho}' tem extensão .gz mas não é um arquivo gzip válido")
+        except OSError as e:
+            parser.error(f"não consegui ler o arquivo: {e}")
+    # não deveria chegar aqui (latin-1 não falha), mas por segurança:
+    with open(caminho, "r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
+
+
 def main():
     # Garante que acentos apareçam direito no terminal do Windows
     try:
@@ -603,20 +947,36 @@ def main():
             "Exemplos:\n"
             "  python scarface.py auth.log\n"
             "  python scarface.py access.log --saida relatorio.md --json dados.json\n"
+            "  python scarface.py auth.log --whitelist 192.168.0.0/16,10.0.0.5\n"
+            "  python scarface.py access.log.gz\n"
             "  python scarface.py --demo\n"
         ),
     )
-    parser.add_argument("arquivo", nargs="?", help="caminho do arquivo de log")
+    parser.add_argument("arquivo", nargs="?", help="caminho do arquivo de log (aceita .gz)")
     parser.add_argument("--demo", action="store_true",
                         help="analisa um log fictício de demonstração")
-    parser.add_argument("--formato", choices=["auto", "auth", "apache", "geral"],
+    parser.add_argument("--demo-tipo", choices=["auth", "apache"], default="auth",
+                        help="qual log fictício usar com --demo: 'auth' (SSH, padrão) "
+                             "ou 'apache' (HTTP, mostra escaneamento e ataques em URL)")
+    parser.add_argument("--formato", choices=["auto", "auth", "apache", "nginx", "json", "geral"],
                         default="auto", help="formato do log (padrão: auto)")
-    parser.add_argument("--limite", type=int, default=LIMITE_FALHAS,
+    parser.add_argument("--limite", type=inteiro_positivo, default=LIMITE_FALHAS,
                         help=f"falhas para alerta de brute force (padrão: {LIMITE_FALHAS})")
-    parser.add_argument("--janela", type=int, default=JANELA_PADRAO,
+    parser.add_argument("--janela", type=inteiro_nao_negativo, default=JANELA_PADRAO,
                         help=f"janela de tempo em segundos (padrão: {JANELA_PADRAO})")
-    parser.add_argument("--limite-404", dest="limite_404", type=int, default=LIMITE_404,
+    parser.add_argument("--limite-404", dest="limite_404", type=inteiro_positivo, default=LIMITE_404,
                         help=f"404 para alerta de escaneamento (padrão: {LIMITE_404})")
+    parser.add_argument("--janela-comprometimento", dest="janela_comprometimento",
+                        type=inteiro_positivo, default=JANELA_COMPROMETIMENTO,
+                        help="segundos entre a última falha e o sucesso para "
+                             f"considerar comprometimento (padrão: {JANELA_COMPROMETIMENTO})")
+    parser.add_argument("--minimo-ips-distribuido", dest="minimo_ips_distribuido",
+                        type=inteiro_positivo, default=3,
+                        help="nº mínimo de IPs distintos visando o mesmo usuário para "
+                             "alertar brute force distribuído (padrão: 3)")
+    parser.add_argument("--whitelist", default="",
+                        help="IPs/faixas CIDR a ignorar em todas as detecções, "
+                             "separados por vírgula (ex.: 192.168.0.0/16,10.0.0.5)")
     parser.add_argument("--saida", help="salva relatório em Markdown neste arquivo")
     parser.add_argument("--json", dest="json_saida",
                         help="salva dados estruturados em JSON neste arquivo")
@@ -628,25 +988,40 @@ def main():
     if not args.arquivo and not args.demo:
         parser.error("informe um arquivo de log ou use --demo")
 
+    # Valida os caminhos de saída ANTES de processar o log inteiro —
+    # evita gastar tempo com um arquivo gigante só pra descobrir no
+    # final que a pasta de destino não existe ou está sem permissão.
+    if args.saida:
+        validar_caminho_saida(args.saida, parser)
+    if args.json_saida:
+        validar_caminho_saida(args.json_saida, parser)
+
+    whitelist_redes, whitelist_invalidos = carregar_whitelist(args.whitelist)
+    if whitelist_invalidos:
+        parser.error(f"entradas inválidas em --whitelist: {', '.join(whitelist_invalidos)}")
+
     # 1. Carrega as linhas do log
     if args.demo:
-        linhas = demo_auth()
-        nome_arquivo, formato, fonte_formato = "(demonstração)", "auth", "demo"
+        if args.demo_tipo == "apache":
+            linhas = demo_apache()
+            nome_arquivo, formato, fonte_formato = "(demonstração HTTP)", "apache", "demo"
+        else:
+            linhas = demo_auth()
+            nome_arquivo, formato, fonte_formato = "(demonstração)", "auth", "demo"
     else:
-        try:
-            with open(args.arquivo, "r", encoding="utf-8", errors="replace") as f:
-                linhas = f.readlines()
-        except OSError as e:
-            parser.error(f"não consegui ler o arquivo: {e}")
+        linhas = ler_log(args.arquivo, parser)
         nome_arquivo = args.arquivo
 
-    # 2. Define o formato (detecção automática ou escolha manual)
-    if args.formato == "auto":
-        formato = detectar_formato(linhas)
-        fonte_formato = "detectado"
-    else:
-        formato = args.formato
-        fonte_formato = "informado"
+    # 2. Define o formato (detecção automática ou escolha manual).
+    # No modo --demo o formato já é conhecido (view acima), então só
+    # detectamos/aplicamos --formato quando um arquivo real foi informado.
+    if not args.demo:
+        if args.formato == "auto":
+            formato = detectar_formato(linhas)
+            fonte_formato = "detectado"
+        else:
+            formato = args.formato
+            fonte_formato = "informado"
 
     # 3. Interpreta as linhas
     registros = parsear_linhas(linhas, formato)
@@ -668,15 +1043,19 @@ def main():
             "interpretadas": interpretadas,
             "ignoradas": total - interpretadas,
         },
-        "brute_force": detectar_brute_force(registros, args.limite, args.janela),
-        "comprometimentos": detectar_comprometimento(registros),
-        "escaneamento": detectar_escaneamento(registros, args.limite_404),
-        "ataques": detectar_ataques(registros),
+        "whitelist": [str(rede) for rede in whitelist_redes],
+        "brute_force": detectar_brute_force(registros, args.limite, args.janela, whitelist_redes),
+        "brute_force_distribuido": detectar_brute_force_distribuido(
+            registros, args.limite, args.janela, args.minimo_ips_distribuido, whitelist_redes),
+        "comprometimentos": detectar_comprometimento(
+            registros, args.janela_comprometimento, whitelist=whitelist_redes),
+        "escaneamento": detectar_escaneamento(registros, args.limite_404, whitelist_redes),
+        "ataques": detectar_ataques(registros, whitelist_redes),
         "top_ips": [(ip, n) for ip, n in top_ips],
     }
 
     # 5. Apresenta e salva os resultados
-    usar_cores = (not args.sem_cor) and sys.stdout.isatty()
+    usar_cores = (not args.sem_cor) and terminal_suporta_cor()
     exibir_console(info, cores=usar_cores)
 
     if args.saida:
@@ -688,4 +1067,28 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  [!] Interrompido pelo usuário (Ctrl+C).")
+        sys.exit(130)
+    except BrokenPipeError:
+        # Acontece quando a saída é cortada no meio, ex.: `scarface.py log | head`
+        # ou o terminal é fechado durante a impressão. Não é um erro real da
+        # ferramenta, então saímos em silêncio em vez de mostrar um traceback.
+        sys.exit(0)
+    except SystemExit:
+        # gerado por parser.error(), --versao, --help etc.: já tratado,
+        # só deixamos propagar com o código de saída correto.
+        raise
+    except Exception as e:
+        # Última linha de defesa: qualquer erro inesperado (log corrompido
+        # de um jeito não previsto, disco cheio ao salvar, etc.) vira uma
+        # mensagem legível em vez de um traceback assustador para quem
+        # for avaliar a ferramenta.
+        try:
+            print(f"\n  [erro inesperado] {type(e).__name__}: {e}")
+            print("  Se achar que isso é um bug, abra uma issue no repositório do projeto.")
+        except BrokenPipeError:
+            pass
+        sys.exit(1)
