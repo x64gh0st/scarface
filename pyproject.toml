@@ -3,22 +3,24 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scarface-log-analyzer"
-version = "2.1.0a1"
-description = "Analisador de logs que caça brute force, comprometimento de contas, escaneamento e ataques em URL (SQLi, XSS, Path Traversal, Command Injection)."
+name = "scarface-scanner"
+version = "3.0.0"
+description = "Scanner de portas TCP em Python, inspirado no nmap: descoberta de hosts, escaneamento, identificação de serviços e banners. Sem dependências."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "Educational / Portfolio use" }
+license = { text = "MIT" }
 authors = [
-    { name = "Pedro Henrique Almeida", email = "" }
+    { name = "Pedro Henrique Almeida" }
 ]
-keywords = ["cybersecurity", "log-analysis", "brute-force", "siem", "pentest", "blue-team"]
+keywords = ["port-scanner", "nmap", "network", "security", "pentest", "cybersecurity", "banner-grabbing"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Security",
-    "Topic :: System :: Logging",
+    "Topic :: System :: Networking :: Monitoring",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -29,7 +31,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "build", "twine"]
 
 [project.scripts]
 scarface = "scarface:main"
@@ -37,6 +39,10 @@ scarface = "scarface:main"
 [project.urls]
 Repository = "https://github.com/x64gh0st/scarface"
 Changelog = "https://github.com/x64gh0st/scarface/blob/main/CHANGELOG.md"
+Issues = "https://github.com/x64gh0st/scarface/issues"
 
 [tool.setuptools]
 py-modules = ["scarface"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_scarface.py"]

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+# resultados gerados pela própria ferramenta
+resultado*.json
+rede*.json
+scan_*.json
+# sistema / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

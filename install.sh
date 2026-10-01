@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-# install.sh - instalador do SCARFACE para Linux
+# install.sh - instalador do SCARFACE para Linux/macOS
 #
 # O que este script faz:
-#   1. Confere se o Python 3.8+ está instalado (avisa como instalar
-#      se não estiver, de acordo com a distro detectada)
+#   1. Confere se o Python 3.8+ está instalado
 #   2. Dá permissão de execução ao scarface.py
-#   3. Roda um teste rápido (--demo) pra confirmar que está funcional
-#   4. Opcionalmente instala o comando `scarface` no PATH, para
-#      poder rodar de qualquer pasta sem precisar digitar o
-#      caminho completo nem "python3 scarface.py"
-#      (usa /usr/local/bin com sudo, ou ~/.local/bin sem sudo)
+#   3. Roda um teste rápido (scan em localhost) para confirmar
+#      que está funcional
+#   4. Opcionalmente instala o comando `scarface` no PATH
+#      (/usr/local/bin com sudo, ou ~/.local/bin sem sudo)
 #   5. Opcionalmente instala o pytest para rodar os testes
 #
 # Uso:
 #   chmod +x install.sh
 #   ./install.sh              # instala
 #   ./install.sh --uninstall  # remove o comando global 'scarface'
+#
+# Dica: se preferir, `pipx install scarface-scanner` faz tudo isso.
 # ============================================================
 
 set -euo pipefail
@@ -82,10 +82,9 @@ fi
 # 2. Verifica o Python 3.8+
 # ------------------------------------------------------------
 if command -v python3 >/dev/null 2>&1; then
-    VERSAO_PYTHON="$(python3 --version 2>&1)"
-    info "Python encontrado: $VERSAO_PYTHON"
+    info "Python encontrado: $(python3 --version 2>&1)"
     if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)'; then
-        erro "O SCARFACE precisa do Python 3.8 ou mais recente. Atualize seu Python e rode este instalador de novo."
+        erro "O SCARFACE precisa do Python 3.8 ou mais recente. Atualize o Python e rode este instalador de novo."
         exit 1
     fi
 else
@@ -96,8 +95,10 @@ else
         aviso "Instale com: sudo dnf install python3 -y"
     elif command -v pacman >/dev/null 2>&1; then
         aviso "Instale com: sudo pacman -S python --noconfirm"
+    elif command -v brew >/dev/null 2>&1; then
+        aviso "Instale com: brew install python"
     else
-        aviso "Instale o Python 3 usando o gerenciador de pacotes da sua distro."
+        aviso "Instale o Python 3 usando o gerenciador de pacotes do seu sistema."
     fi
     exit 1
 fi
@@ -109,13 +110,13 @@ chmod +x scarface.py
 info "Permissão de execução concedida a scarface.py"
 
 # ------------------------------------------------------------
-# 4. Teste rápido (modo demo) para confirmar que está funcional
+# 4. Teste rápido: scan em localhost (não precisa de rede externa)
 # ------------------------------------------------------------
-info "Rodando teste rápido (--demo --sem-cor)..."
-if python3 scarface.py --demo --sem-cor >/dev/null 2>&1; then
+info "Rodando teste rápido (scan em 127.0.0.1)..."
+if python3 scarface.py 127.0.0.1 -p 1-100 -Pn --sem-cor >/dev/null 2>&1; then
     info "Teste OK — o SCARFACE está funcional."
 else
-    erro "O teste com --demo falhou. Rode 'python3 scarface.py --demo' manualmente para ver o erro completo."
+    erro "O teste falhou. Rode 'python3 scarface.py 127.0.0.1 -p 1-100 -Pn' manualmente para ver o erro."
     exit 1
 fi
 
@@ -125,15 +126,15 @@ fi
 echo
 read -r -p "Deseja instalar o comando 'scarface' globalmente? [s/N] " resposta
 if [[ "$resposta" =~ ^[sS]$ ]]; then
+    usar_sudo="n"
     if command -v sudo >/dev/null 2>&1; then
         read -r -p "  Usar sudo para instalar em $DESTINO_SUDO (acessível a todos os usuários)? [S/n] " usar_sudo
-    else
-        usar_sudo="n"
+        usar_sudo="${usar_sudo:-s}"
     fi
 
     if [[ ! "$usar_sudo" =~ ^[nN]$ ]] && command -v sudo >/dev/null 2>&1; then
         if sudo cp scarface.py "$DESTINO_SUDO" && sudo chmod +x "$DESTINO_SUDO"; then
-            info "Instalado em $DESTINO_SUDO — rode 'scarface --demo' de qualquer pasta."
+            info "Instalado em $DESTINO_SUDO — rode 'scarface --versao' de qualquer pasta."
         else
             erro "Não consegui copiar para $DESTINO_SUDO."
         fi
@@ -146,7 +147,7 @@ if [[ "$resposta" =~ ^[sS]$ ]]; then
             aviso "~/.local/bin não está no seu PATH ainda. Adicione ao seu ~/.bashrc ou ~/.zshrc:"
             aviso "  export PATH=\"\$HOME/.local/bin:\$PATH\""
         else
-            info "Rode 'scarface --demo' de qualquer pasta."
+            info "Rode 'scarface --versao' de qualquer pasta."
         fi
     fi
 else
@@ -154,18 +155,17 @@ else
 fi
 
 # ------------------------------------------------------------
-# 6. Oferece instalar o pytest para os testes unitários
+# 6. Oferece instalar o pytest para os testes
 # ------------------------------------------------------------
 echo
 if [ -f "test_scarface.py" ]; then
-    read -r -p "Deseja instalar o pytest para rodar os testes unitários? [s/N] " resposta_testes
+    read -r -p "Deseja instalar o pytest para rodar os testes? [s/N] " resposta_testes
     if [[ "$resposta_testes" =~ ^[sS]$ ]]; then
         if command -v pip3 >/dev/null 2>&1; then
             if pip3 install pytest --break-system-packages 2>/dev/null || pip3 install pytest; then
                 info "pytest instalado. Rode: pytest test_scarface.py -v"
             else
-                aviso "Não consegui instalar o pytest automaticamente. Tente manualmente:"
-                aviso "  pip3 install pytest --break-system-packages"
+                aviso "Não consegui instalar o pytest automaticamente. Tente: pip3 install pytest"
             fi
         else
             aviso "pip3 não encontrado. Instale-o primeiro (ex.: sudo apt install python3-pip)."
@@ -176,9 +176,9 @@ fi
 echo
 info "Instalação concluída — $(python3 scarface.py --versao)"
 echo "  Exemplos de uso:"
-echo "    python3 scarface.py --demo"
-echo "    python3 scarface.py --demo --demo-tipo apache"
-echo "    python3 scarface.py auth.log --saida relatorio.md --json dados.json"
-echo "    sudo python3 scarface.py /var/log/auth.log"
+echo "    scarface 192.168.0.1"
+echo "    scarface scanme.nmap.org -p 22,80,443 -sV"
+echo "    scarface 192.168.0.0/24 -F -o rede.json"
 echo
 echo "  Para desinstalar o comando global: ./install.sh --uninstall"
+echo "  Use apenas em sistemas seus ou com autorização explícita."
